@@ -1,254 +1,195 @@
 package HbaseSparkQL
 
 import HbaseSparkQL.FeatureHelper.{vector_addition}
-import org.apache.spark.mllib.linalg.{Vector, Vectors, VectorUDT, SparseVector}
-import org.apache.spark.sql.expressions.MutableAggregationBuffer
-import org.apache.spark.sql.expressions.UserDefinedAggregateFunction
-import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.Row
+import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT, SparseVector, DenseVector}
+import org.apache.spark.sql.{DataFrame, Row, SparkSession, Encoder, Encoders}
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.expressions.Aggregator
+import org.apache.spark.sql.functions.udaf
 import org.apache.spark.sql.types._
 import scala.collection.mutable.WrappedArray
 import scala.language.implicitConversions
- 
-package object SqlHelper{
+
+package object SqlHelper {
     
     // perform zipWithIndex on DataFrame's like what you can do with RDD's
     def dfZipWithIndex(
         df: DataFrame,
-        offset: Int = 1,
+        offset: Long = 1L,
         colName: String = "id",
         inFront: Boolean = true
-    ) : DataFrame = {
-    df.sqlContext.createDataFrame(
-        df.rdd.zipWithIndex.map(ln =>
-            Row.fromSeq(
-                (if (inFront) Seq(ln._2 + offset) else Seq())
-                    ++ ln._1.toSeq ++
-                (if (inFront) Seq() else Seq(ln._2 + offset))
-            )
-        ),
-        StructType(
-                (if (inFront) Array(StructField(colName,LongType,false)) else Array[StructField]()) 
-                    ++ df.schema.fields ++ 
-                (if (inFront) Array[StructField]() else Array(StructField(colName,LongType,false)))
-            )
-        ) 
+    ): DataFrame = {
+        val spark = df.sparkSession
+        val rddIndexed = df.rdd.zipWithIndex().map { case (row, idx) =>
+            val newIdx = idx + offset
+            val values = row.toSeq
+            val newRow = if (inFront) Seq(newIdx) ++ values else values ++ Seq(newIdx)
+            Row.fromSeq(newRow)
+        }
+        val idField = StructField(colName, LongType, nullable = false)
+        val schema = if (inFront) {
+            StructType(Array(idField) ++ df.schema.fields)
+        } else {
+            StructType(df.schema.fields ++ Array(idField))
+        }
+        spark.createDataFrame(rddIndexed, schema)
     }
 
-    class vector_mean extends UserDefinedAggregateFunction {
-        private val vertical_size = 5851    // size of publisher verticals
-        private val VecType = new VectorUDT()
-        // Schema you get as an input
-        def inputSchema = new StructType().add("vec", VecType)
-        // Schema of the row which is used for aggregation
-        def bufferSchema = new StructType().add("vec", VecType)
-                               .add("count", IntegerType)
-        // Returned type
-        def dataType = VecType
-        // Self-explaining 
-        def deterministic = true
-        // zero value
-        def initialize(buffer: MutableAggregationBuffer): Unit = {
-            buffer.update(0, Vectors.sparse(vertical_size, Array(), Array()))
-            buffer.update(1, 0)
-        }
-        // Similar to seqOp in aggregate
-        def update(buffer: MutableAggregationBuffer, input: Row) = {
-            if(!input.isNullAt(0)) {
-                val vec = input.getAs[Vector](0)
-                val agg: Vector = buffer.get(0).asInstanceOf[Vector]
-                val count: Int = buffer.getInt(1)
-                val newAgg = vector_addition(agg, vec)
-                buffer.update(0, newAgg)
-                buffer.update(1, count + 1)
-            }
-        }
-        // Similar to combOp in aggregate
-        def merge(buffer1: MutableAggregationBuffer, buffer2: Row) = {
-            val agg2: Vector = buffer2.get(0).asInstanceOf[Vector]
-            val agg1: Vector = buffer1.get(0).asInstanceOf[Vector]
-            val count2: Int = buffer2.getInt(1)
-            val count1: Int = buffer1.getInt(1)
-            val newAgg = vector_addition(agg1, agg2)
-            buffer1.update(0, newAgg)
-            buffer1.update(1, count1 + count2)
-        }
-        // Called on exit to get return value
-        def evaluate(buffer: Row): Vector = {
-            val oldVec = buffer.get(0).asInstanceOf[SparseVector]
-            val oldValues = oldVec.values
-            var newIndices = new Array[Int](oldVec.indices.size)
-            var newValues = new Array[Double](oldValues.size)
-            val count = buffer.getInt(1)
-            // calculate vector mean from vector sum
-            Array.copy(oldVec.indices, 0, newIndices, 0, newIndices.length)
-            for (i <- 0 to newValues.size - 1){
-                newValues(i) = oldValues(i) / count
-            }
-            Vectors.sparse(vertical_size, newIndices, newValues)
-        }
-    }
+    // --- Vector Sum Aggregator ---
+    case class VectorSumState(var sum: Array[Double], var initialized: Boolean)
 
-    class vector_sum extends UserDefinedAggregateFunction {
-        private val vertical_size = 5851    // size of publisher verticals
-        private val VecType = new VectorUDT()
-        // Schema you get as an input
-        def inputSchema = new StructType().add("vec", VecType)
-        // Schema of the row which is used for aggregation
-        def bufferSchema = new StructType().add("vec", VecType)
-        // Returned type
-        def dataType = VecType
-        // Self-explaining 
-        def deterministic = true
-        // zero value
-        def initialize(buffer: MutableAggregationBuffer): Unit = {
-            buffer.update(0, Vectors.sparse(vertical_size, Array(), Array()))
-        }
-        // Similar to seqOp in aggregate
-        def update(buffer: MutableAggregationBuffer, input: Row) = {
-            if(!input.isNullAt(0)) {
-            val vec = input.getAs[Vector](0)
-            val agg: Vector = buffer.get(0).asInstanceOf[Vector]
-            val newAgg = vector_addition(agg, vec)
-            buffer.update(0, newAgg)
-            }
-        }
-        // Similar to combOp in aggregate
-        def merge(buffer1: MutableAggregationBuffer, buffer2: Row) = {
-            val agg2: Vector = buffer2.get(0).asInstanceOf[Vector]
-            val agg1: Vector = buffer1.get(0).asInstanceOf[Vector]
-            val newAgg = vector_addition(agg1, agg2)
-            buffer1.update(0, newAgg)
-        }
-        // Called on exit to get return value
-        def evaluate(buffer: Row): Vector = {
-            val vec = buffer.get(0).asInstanceOf[SparseVector]
-            Vectors.sparse(vertical_size, vec.indices, vec.values)
-        }
-    }
+    class VectorSumAggregator(val vectorSize: Int = 5851) extends Aggregator[Vector, VectorSumState, Vector] {
+        override def zero: VectorSumState = VectorSumState(new Array[Double](vectorSize), initialized = false)
 
-    // sort grouped tuples with the second element.
-    class sort_second_element extends UserDefinedAggregateFunction {
-        // Schema you get as an input
-        def tupSchema = new StructType(
-            Array(
-                StructField("_1", StringType,false),
-                StructField("_2", DoubleType,false)
-            )
-        )
-        def inputSchema = new StructType().add("tup", tupSchema)
-        // Intermediate Schema
-        def bufferSchema = new StructType().add("seq", ArrayType(tupSchema, false))
-        // Returned type
-        override def dataType = ArrayType(tupSchema, true)
-        // Self-explaining
-        def deterministic = true
-        // zero value
-        def initialize(buffer: MutableAggregationBuffer): Unit = {
-            buffer.update(0, Seq())
-        }
-        // Similar to seqOp in aggregate
-        def update(buffer: MutableAggregationBuffer, input: Row) = {
-            if(!input.isNullAt(0)) {
-                val sub_row = input.get(0).asInstanceOf[Row]
-                val agg = buffer.get(0).asInstanceOf[Seq[Row]]
-                val newAgg = agg :+ sub_row
-                buffer.update(0, newAgg)
-            }
-        }
-        // Similar to combOp in aggregate
-        def merge(buffer1: MutableAggregationBuffer, buffer2: Row) = {
-            val agg2 = buffer2.get(0).asInstanceOf[Seq[Row]]
-            val agg1 = buffer1.get(0).asInstanceOf[Seq[Row]]
-            val newAgg = agg1 ++ agg2
-            buffer1.update(0, newAgg)
-        }
-        // Called on exit to get return value
-        def evaluate(buffer: Row): Seq[Row] = {
-            val seq = buffer.get(0).asInstanceOf[Seq[Row]]
-            seq.sortWith{(r1,r2) => 
-                r1.getDouble(1) < r2.getDouble(1)
-            }
-        }
-    }
-
-    // aggregate RelationalGroupedDataset to a dataset of sets of given type type
-    // input: 
-    //       aggTypeString - type of values of the aggregated set (string, integer, or double)
-    class AggregateToSet(aggTypeString: String) extends UserDefinedAggregateFunction {
-        // Schema you get as an input
-        assert( Seq("string", "integer", "double", "string array").contains(aggTypeString) )
-        def aggSqlType = aggTypeString match {
-            case "string" => StringType
-            case "integer" => IntegerType
-            case "double" => DoubleType
-            case "string array" => ArrayType(StringType, false)
-        }
-        def inputSchema = new StructType().add("val", aggSqlType)
-        // Intermediate Schema
-        def bufferSchema = aggTypeString match {
-                case "string array" => new StructType().add("seq", aggSqlType)
-                case _ => new StructType().add("seq", ArrayType(aggSqlType, false))
-            }
-        // Returned type
-        override def dataType = aggTypeString match {
-            case "string array" => aggSqlType
-            case _ => ArrayType(aggSqlType, true)
-        }
-        // Self-explaining
-        def deterministic = true
-        // zero value
-        def initialize(buffer: MutableAggregationBuffer): Unit = {
-            buffer.update(0, Seq())
-        }
-        // Similar to seqOp in aggregate
-        def update(buffer: MutableAggregationBuffer, input: Row) = {
-            if(!input.isNullAt(0)) {
-                val elem = aggTypeString match {
-                    case "string" => input.get(0).asInstanceOf[String]
-                    case "integer" => input.get(0).asInstanceOf[Int]
-                    case "double" => input.get(0).asInstanceOf[Double]
-                    case "string array" => input.get(0).asInstanceOf[Seq[String]]
+        override def reduce(buffer: VectorSumState, input: Vector): VectorSumState = {
+            if (input != null) {
+                if (!buffer.initialized) {
+                    val inputArr = input.toArray
+                    val copyLen = math.min(buffer.sum.length, inputArr.length)
+                    Array.copy(inputArr, 0, buffer.sum, 0, copyLen)
+                    buffer.initialized = true
+                } else {
+                    val inputArr = input.toArray
+                    var i = 0
+                    val limit = math.min(buffer.sum.length, inputArr.length)
+                    while (i < limit) {
+                        buffer.sum(i) += inputArr(i)
+                        i += 1
+                    }
                 }
-                val agg = aggTypeString match {
-                    case "string" => buffer.get(0).asInstanceOf[Seq[String]]
-                    case "integer" => buffer.get(0).asInstanceOf[Seq[Int]]
-                    case "double" => buffer.get(0).asInstanceOf[Seq[Double]]
-                    case "string array" => buffer.get(0).asInstanceOf[Seq[String]]
+            }
+            buffer
+        }
+
+        override def merge(b1: VectorSumState, b2: VectorSumState): VectorSumState = {
+            if (!b1.initialized) b2
+            else if (!b2.initialized) b1
+            else {
+                var i = 0
+                while (i < b1.sum.length && i < b2.sum.length) {
+                    b1.sum(i) += b2.sum(i)
+                    i += 1
                 }
-                val newAgg = aggTypeString match {
-                    case "string array" => agg ++ elem.asInstanceOf[Seq[String]].toSet.toSeq
-                    case _ => agg :+ elem
+                b1
+            }
+        }
+
+        override def finish(reduction: VectorSumState): Vector = {
+            Vectors.dense(reduction.sum)
+        }
+
+        override def bufferEncoder: Encoder[VectorSumState] = Encoders.product[VectorSumState]
+        override def outputEncoder: Encoder[Vector] = ExpressionEncoder[Vector]()
+    }
+
+    // --- Vector Mean Aggregator ---
+    case class VectorMeanState(var sum: Array[Double], var count: Long, var initialized: Boolean)
+
+    class VectorMeanAggregator(val vectorSize: Int = 5851) extends Aggregator[Vector, VectorMeanState, Vector] {
+        override def zero: VectorMeanState = VectorMeanState(new Array[Double](vectorSize), 0L, initialized = false)
+
+        override def reduce(buffer: VectorMeanState, input: Vector): VectorMeanState = {
+            if (input != null) {
+                if (!buffer.initialized) {
+                    val inputArr = input.toArray
+                    val copyLen = math.min(buffer.sum.length, inputArr.length)
+                    Array.copy(inputArr, 0, buffer.sum, 0, copyLen)
+                    buffer.count = 1L
+                    buffer.initialized = true
+                } else {
+                    val inputArr = input.toArray
+                    var i = 0
+                    val limit = math.min(buffer.sum.length, inputArr.length)
+                    while (i < limit) {
+                        buffer.sum(i) += inputArr(i)
+                        i += 1
+                    }
+                    buffer.count += 1L
                 }
-                buffer.update(0, newAgg)
+            }
+            buffer
+        }
+
+        override def merge(b1: VectorMeanState, b2: VectorMeanState): VectorMeanState = {
+            if (!b1.initialized) b2
+            else if (!b2.initialized) b1
+            else {
+                var i = 0
+                while (i < b1.sum.length && i < b2.sum.length) {
+                    b1.sum(i) += b2.sum(i)
+                    i += 1
+                }
+                b1.count += b2.count
+                b1
             }
         }
-        // Similar to combOp in aggregate
-        def merge(buffer1: MutableAggregationBuffer, buffer2: Row) = {
-            val agg2 = aggTypeString match {
-                case "string" => buffer2.get(0).asInstanceOf[Seq[String]]
-                case "integer" => buffer2.get(0).asInstanceOf[Seq[Int]]
-                case "double" => buffer2.get(0).asInstanceOf[Seq[Double]]
-                case "string array" => buffer2.get(0).asInstanceOf[Seq[String]]
+
+        override def finish(reduction: VectorMeanState): Vector = {
+            if (reduction.count == 0L) {
+                Vectors.dense(reduction.sum)
+            } else {
+                val meanArr = reduction.sum.map(_ / reduction.count.toDouble)
+                Vectors.dense(meanArr)
             }
-            val agg1 = aggTypeString match {
-                case "string" => buffer1.get(0).asInstanceOf[Seq[String]]
-                case "integer" => buffer1.get(0).asInstanceOf[Seq[Int]]
-                case "double" => buffer1.get(0).asInstanceOf[Seq[Double]]
-                case "string array" => buffer1.get(0).asInstanceOf[Seq[String]]
-            }
-            val newAgg = agg1 ++ agg2
-            buffer1.update(0, newAgg)
         }
-        // Called on exit to get return value
-        def evaluate(buffer: Row): Seq[Any] = {
-            val orgSeq = aggTypeString match {
-                case "string" => buffer.get(0).asInstanceOf[Seq[String]]
-                case "integer" => buffer.get(0).asInstanceOf[Seq[Int]]
-                case "double" => buffer.get(0).asInstanceOf[Seq[Double]]
-                case "string array" => buffer.get(0).asInstanceOf[Seq[String]]
-            }
-            orgSeq.toSet.toSeq
+
+        override def bufferEncoder: Encoder[VectorMeanState] = Encoders.product[VectorMeanState]
+        override def outputEncoder: Encoder[Vector] = ExpressionEncoder[Vector]()
+    }
+
+    // --- Sort Second Element Aggregator ---
+    case class TupleElement(first: String, second: Double)
+
+    class SortSecondElementAggregator extends Aggregator[TupleElement, Seq[TupleElement], Seq[TupleElement]] {
+        override def zero: Seq[TupleElement] = Seq.empty[TupleElement]
+
+        override def reduce(buffer: Seq[TupleElement], input: TupleElement): Seq[TupleElement] = {
+            if (input != null) buffer :+ input else buffer
         }
+
+        override def merge(b1: Seq[TupleElement], b2: Seq[TupleElement]): Seq[TupleElement] = {
+            b1 ++ b2
+        }
+
+        override def finish(reduction: Seq[TupleElement]): Seq[TupleElement] = {
+            reduction.sortBy(_.second)
+        }
+
+        override def bufferEncoder: Encoder[Seq[TupleElement]] = Encoders.product[Seq[TupleElement]]
+        override def outputEncoder: Encoder[Seq[TupleElement]] = Encoders.product[Seq[TupleElement]]
+    }
+
+    // --- Aggregate To Set Aggregator ---
+    class AggregateToSetAggregator[T: Encoder] extends Aggregator[T, Set[T], Seq[T]] {
+        override def zero: Set[T] = Set.empty[T]
+
+        override def reduce(buffer: Set[T], input: T): Set[T] = {
+            if (input != null) buffer + input else buffer
+        }
+
+        override def merge(b1: Set[T], b2: Set[T]): Set[T] = {
+            b1 ++ b2
+        }
+
+        override def finish(reduction: Set[T]): Seq[T] = {
+            reduction.toSeq
+        }
+
+        override def bufferEncoder: Encoder[Set[T]] = ExpressionEncoder[Set[T]]()
+        override def outputEncoder: Encoder[Seq[T]] = ExpressionEncoder[Seq[T]]()
+    }
+
+    // Convenience UDF registration helpers for Spark 3.5
+    def registerVectorSumUdaf(spark: SparkSession, name: String = "vector_sum", size: Int = 5851): Unit = {
+        spark.udf.register(name, udaf(new VectorSumAggregator(size)))
+    }
+
+    def registerVectorMeanUdaf(spark: SparkSession, name: String = "vector_mean", size: Int = 5851): Unit = {
+        spark.udf.register(name, udaf(new VectorMeanAggregator(size)))
+    }
+
+    def registerAggregateToStringSetUdaf(spark: SparkSession, name: String = "agg_to_string_set"): Unit = {
+        implicit val stringEncoder: Encoder[String] = Encoders.STRING
+        spark.udf.register(name, udaf(new AggregateToSetAggregator[String]))
     }
 }

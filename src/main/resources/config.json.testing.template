@@ -6,6 +6,6 @@
         "hbase_site_path"   :   "~/opt/hbase/conf/hbase-site.xml",
         "hadoop_core_site_path" :   "~/opt/hadoop/etc/hadoop/core-site.xml",
         "hadoop_metrics2_hbase_properties": "~/opt/hadoop/etc/hadoop/hadoop-metrics2-hbase.properties", 
-        "hadoop_metrics2_properties":  ""~/opt/hadoop/etc/hadoop/hadoop-metrics2.properties"
+        "hadoop_metrics2_properties":  "~/opt/hadoop/etc/hadoop/hadoop-metrics2.properties"
     }
 }
